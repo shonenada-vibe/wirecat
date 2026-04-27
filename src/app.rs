@@ -3,11 +3,20 @@ use std::{
     time::Instant,
 };
 
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+use ratatui::layout::Rect;
 
 use crate::model::{CaptureEvent, Packet};
 
 const MAX_DIAGNOSTICS: usize = 6;
+const MIN_PANEL_PCT: u16 = 10;
+const PANEL_RESIZE_STEP: u16 = 2;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PanelBorder {
+    PacketsDetails,
+    DetailsHex,
+}
 
 #[derive(Debug)]
 pub struct App {
@@ -20,10 +29,15 @@ pub struct App {
     pub paused: bool,
     pub autoscroll: bool,
     pub should_quit: bool,
+    pub fullscreen_detail: bool,
     pub diagnostics: VecDeque<String>,
     pub protocol_counts: HashMap<String, usize>,
     pub max_packets: usize,
     pub started_at: Instant,
+    pub packets_pct: u16,
+    pub details_pct: u16,
+    pub last_body_area: Option<Rect>,
+    pub dragging_border: Option<PanelBorder>,
 }
 
 impl App {
@@ -36,12 +50,109 @@ impl App {
             display_filter: String::new(),
             editing_filter: false,
             paused: false,
-            autoscroll: true,
+            autoscroll: false,
             should_quit: false,
+            fullscreen_detail: false,
             diagnostics: VecDeque::new(),
             protocol_counts: HashMap::new(),
             max_packets,
             started_at: Instant::now(),
+            packets_pct: 48,
+            details_pct: 28,
+            last_body_area: None,
+            dragging_border: None,
+        }
+    }
+
+    pub fn hex_pct(&self) -> u16 {
+        100u16
+            .saturating_sub(self.packets_pct)
+            .saturating_sub(self.details_pct)
+    }
+
+    fn resize_packets(&mut self, delta: i16) {
+        let new_packets = (self.packets_pct as i16 + delta).clamp(
+            MIN_PANEL_PCT as i16,
+            (100 - MIN_PANEL_PCT as i16 - self.details_pct as i16).max(MIN_PANEL_PCT as i16),
+        ) as u16;
+        let hex = 100 - self.details_pct - new_packets;
+        if hex >= MIN_PANEL_PCT {
+            self.packets_pct = new_packets;
+        }
+    }
+
+    fn resize_details(&mut self, delta: i16) {
+        let new_details = (self.details_pct as i16 + delta).clamp(
+            MIN_PANEL_PCT as i16,
+            (100 - MIN_PANEL_PCT as i16 - self.packets_pct as i16).max(MIN_PANEL_PCT as i16),
+        ) as u16;
+        let hex = 100 - self.packets_pct - new_details;
+        if hex >= MIN_PANEL_PCT {
+            self.details_pct = new_details;
+        }
+    }
+
+    pub fn handle_mouse(&mut self, event: MouseEvent) {
+        let Some(body) = self.last_body_area else {
+            return;
+        };
+        match event.kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                if let Some(border) = self.border_at(body, event.column, event.row) {
+                    self.dragging_border = Some(border);
+                }
+            }
+            MouseEventKind::Drag(MouseButton::Left) => {
+                if let Some(border) = self.dragging_border {
+                    self.apply_drag(body, border, event.row);
+                }
+            }
+            MouseEventKind::Up(MouseButton::Left) => {
+                self.dragging_border = None;
+            }
+            _ => {}
+        }
+    }
+
+    fn border_at(&self, body: Rect, col: u16, row: u16) -> Option<PanelBorder> {
+        if col < body.x || col >= body.x + body.width {
+            return None;
+        }
+        let packets_h = body.height * self.packets_pct / 100;
+        let details_h = body.height * self.details_pct / 100;
+        let border1 = body.y + packets_h.saturating_sub(1);
+        let border2 = body.y + (packets_h + details_h).saturating_sub(1);
+        if row == border1 {
+            Some(PanelBorder::PacketsDetails)
+        } else if row == border2 {
+            Some(PanelBorder::DetailsHex)
+        } else {
+            None
+        }
+    }
+
+    fn apply_drag(&mut self, body: Rect, border: PanelBorder, row: u16) {
+        if body.height == 0 {
+            return;
+        }
+        let row = row.max(body.y).min(body.y + body.height - 1);
+        let offset = row - body.y;
+        let pct = ((offset as u32 + 1) * 100 / body.height as u32) as i32;
+        match border {
+            PanelBorder::PacketsDetails => {
+                let target = pct.clamp(
+                    MIN_PANEL_PCT as i32,
+                    100 - MIN_PANEL_PCT as i32 - self.details_pct as i32,
+                ) as u16;
+                self.packets_pct = target;
+            }
+            PanelBorder::DetailsHex => {
+                let target = pct.clamp(
+                    self.packets_pct as i32 + MIN_PANEL_PCT as i32,
+                    100 - MIN_PANEL_PCT as i32,
+                ) as u16;
+                self.details_pct = target.saturating_sub(self.packets_pct);
+            }
         }
     }
 
@@ -89,15 +200,26 @@ impl App {
         }
 
         match key.code {
-            KeyCode::Char('q') | KeyCode::Esc => self.should_quit = true,
             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.should_quit = true;
             }
+            KeyCode::Char('q') => self.should_quit = true,
+            KeyCode::Esc if !self.fullscreen_detail => self.should_quit = true,
+            KeyCode::Esc | KeyCode::Char('e') if self.fullscreen_detail => {
+                self.fullscreen_detail = false;
+            }
+            KeyCode::Enter if !self.fullscreen_detail && self.selected_packet().is_some() => {
+                self.fullscreen_detail = true;
+            }
+            KeyCode::Char('[') => self.resize_packets(-(PANEL_RESIZE_STEP as i16)),
+            KeyCode::Char(']') => self.resize_packets(PANEL_RESIZE_STEP as i16),
+            KeyCode::Char('{') => self.resize_details(-(PANEL_RESIZE_STEP as i16)),
+            KeyCode::Char('}') => self.resize_details(PANEL_RESIZE_STEP as i16),
             KeyCode::Char('j') | KeyCode::Down => self.select_next(),
             KeyCode::Char('k') | KeyCode::Up => self.select_previous(),
             KeyCode::Char('g') => self.selected = 0,
             KeyCode::Char('G') => self.select_last(),
-            KeyCode::Char('/') => self.editing_filter = true,
+            KeyCode::Char('/') if !self.fullscreen_detail => self.editing_filter = true,
             KeyCode::Char('p') => self.toggle_pause(),
             KeyCode::Char('a') => self.autoscroll = !self.autoscroll,
             KeyCode::Char('c') => self.clear(),

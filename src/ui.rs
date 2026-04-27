@@ -13,7 +13,18 @@ const SELECTED_STYLE: Style = Style::new()
     .bg(Color::Rgb(255, 196, 87))
     .add_modifier(Modifier::BOLD);
 
-pub fn draw(frame: &mut Frame<'_>, app: &App) {
+pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
+    if app.fullscreen_detail {
+        app.last_body_area = None;
+        let root = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Min(1), Constraint::Length(1)])
+            .split(frame.area());
+        draw_fullscreen_detail(frame, root[0], app);
+        draw_fullscreen_footer(frame, root[1]);
+        return;
+    }
+
     let root = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -24,12 +35,57 @@ pub fn draw(frame: &mut Frame<'_>, app: &App) {
         .split(frame.area());
 
     draw_header(frame, root[0], app);
+    app.last_body_area = Some(root[1]);
     draw_body(frame, root[1], app);
     draw_footer(frame, root[2], app);
 
     if app.editing_filter {
         draw_filter_cursor(frame, root[0], app);
     }
+}
+
+fn draw_fullscreen_detail(frame: &mut Frame<'_>, area: Rect, app: &App) {
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Percentage(55), Constraint::Percentage(45)])
+        .split(area);
+
+    let detail_lines = app
+        .selected_packet()
+        .map(packet_detail_lines)
+        .unwrap_or_else(|| vec![Line::from("No packet selected")]);
+    let details = Paragraph::new(detail_lines)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title("Packet Details (fullscreen)"),
+        )
+        .wrap(Wrap { trim: false });
+    frame.render_widget(details, chunks[0]);
+
+    let hex_lines = app
+        .selected_packet()
+        .map(|packet| {
+            if packet.hex_dump.is_empty() {
+                vec![Line::from("No hex dump available")]
+            } else {
+                packet
+                    .hex_dump
+                    .iter()
+                    .map(|line| Line::from(line.clone()))
+                    .collect()
+            }
+        })
+        .unwrap_or_else(|| vec![Line::from("No packet selected")]);
+    let hex = Paragraph::new(hex_lines)
+        .block(Block::default().borders(Borders::ALL).title("Bytes"))
+        .wrap(Wrap { trim: false });
+    frame.render_widget(hex, chunks[1]);
+}
+
+fn draw_fullscreen_footer(frame: &mut Frame<'_>, area: Rect) {
+    let footer = Paragraph::new("e/Esc back | q quit").style(Style::new().fg(Color::DarkGray));
+    frame.render_widget(footer, area);
 }
 
 fn draw_header(frame: &mut Frame<'_>, area: Rect, app: &App) {
@@ -78,9 +134,9 @@ fn draw_body(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Percentage(48),
-            Constraint::Percentage(28),
-            Constraint::Percentage(24),
+            Constraint::Percentage(app.packets_pct),
+            Constraint::Percentage(app.details_pct),
+            Constraint::Percentage(app.hex_pct()),
         ])
         .split(area);
 
@@ -191,7 +247,7 @@ fn draw_footer(frame: &mut Frame<'_>, area: Rect, app: &App) {
         .map(|value| format!(" | {value}"))
         .unwrap_or_default();
     let text = format!(
-        "q quit | / filter | p pause | a autoscroll | j/k move | g/G top/bottom | c clear{latest_diag}"
+        "q quit | Enter detail | / filter | p pause | a autoscroll | j/k move | g/G top/bottom | c clear | [/] resize packets | {{/}} resize details | drag borders{latest_diag}"
     );
     let footer = Paragraph::new(text).style(Style::new().fg(Color::DarkGray));
     frame.render_widget(footer, area);
