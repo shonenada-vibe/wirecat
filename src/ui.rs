@@ -6,7 +6,7 @@ use ratatui::{
     widgets::{Block, Borders, Cell, Paragraph, Row, Table, TableState, Wrap},
 };
 
-use crate::{app::App, model::Packet};
+use crate::{app::App, http::HttpTransaction, model::Packet};
 
 const SELECTED_STYLE: Style = Style::new()
     .fg(Color::Black)
@@ -45,6 +45,22 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
 }
 
 fn draw_fullscreen_detail(frame: &mut Frame<'_>, area: Rect, app: &App) {
+    if app.http_mode {
+        let lines = app
+            .selected_http_transaction()
+            .map(http_transaction_detail_lines)
+            .unwrap_or_else(|| vec![Line::from("No HTTP request selected")]);
+        let details = Paragraph::new(lines)
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title("HTTP Request Details"),
+            )
+            .wrap(Wrap { trim: false });
+        frame.render_widget(details, area);
+        return;
+    }
+
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Percentage(55), Constraint::Percentage(45)])
@@ -131,6 +147,19 @@ fn draw_header(frame: &mut Frame<'_>, area: Rect, app: &App) {
 }
 
 fn draw_body(frame: &mut Frame<'_>, area: Rect, app: &App) {
+    if app.http_mode {
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Percentage(app.packets_pct),
+                Constraint::Percentage(app.details_pct + app.hex_pct()),
+            ])
+            .split(area);
+        draw_http_table(frame, chunks[0], app);
+        draw_http_details(frame, chunks[1], app);
+        return;
+    }
+
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -143,6 +172,235 @@ fn draw_body(frame: &mut Frame<'_>, area: Rect, app: &App) {
     draw_packet_table(frame, chunks[0], app);
     draw_details(frame, chunks[1], app);
     draw_hex(frame, chunks[2], app);
+}
+
+fn draw_http_table(frame: &mut Frame<'_>, area: Rect, app: &App) {
+    let rows = app.transactions.iter().map(|tx| {
+        let status = tx
+            .status_code
+            .map(|code| code.to_string())
+            .unwrap_or_else(|| "—".to_string());
+        let status_style = match tx.status_code {
+            Some(code) if (200..300).contains(&code) => Style::new().fg(Color::Green),
+            Some(code) if (300..400).contains(&code) => Style::new().fg(Color::Cyan),
+            Some(code) if (400..500).contains(&code) => Style::new().fg(Color::Yellow),
+            Some(code) if (500..600).contains(&code) => Style::new().fg(Color::Red),
+            _ => Style::new().fg(Color::Gray),
+        };
+        let host = tx.host.clone().unwrap_or_else(|| tx.destination.clone());
+        let kind = tx.content_type.clone().unwrap_or_else(|| "—".to_string());
+        let size = tx
+            .content_length
+            .map(human_size)
+            .unwrap_or_else(|| "—".to_string());
+        let time = tx
+            .response_timestamp
+            .as_deref()
+            .or(Some(tx.request_timestamp.as_str()))
+            .unwrap_or("")
+            .to_string();
+        Row::new(vec![
+            Cell::from(tx.number.to_string()),
+            Cell::from(tx.method.clone()).style(Style::new().fg(Color::Magenta)),
+            Cell::from(status).style(status_style),
+            Cell::from(host),
+            Cell::from(tx.path.clone()),
+            Cell::from(kind),
+            Cell::from(size),
+            Cell::from(time),
+        ])
+    });
+
+    let header = Row::new([
+        "No", "Method", "Status", "Host", "Path", "Type", "Size", "Time",
+    ])
+    .style(
+        Style::new()
+            .fg(Color::Rgb(131, 220, 255))
+            .add_modifier(Modifier::BOLD),
+    );
+
+    let table = Table::new(
+        rows,
+        [
+            Constraint::Length(5),
+            Constraint::Length(7),
+            Constraint::Length(6),
+            Constraint::Length(24),
+            Constraint::Min(20),
+            Constraint::Length(20),
+            Constraint::Length(8),
+            Constraint::Length(26),
+        ],
+    )
+    .header(header)
+    .block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title("HTTP Requests"),
+    )
+    .row_highlight_style(SELECTED_STYLE)
+    .highlight_symbol(">> ");
+
+    let mut state = TableState::default().with_selected(Some(app.selected_transaction));
+    frame.render_stateful_widget(table, area, &mut state);
+}
+
+fn draw_http_details(frame: &mut Frame<'_>, area: Rect, app: &App) {
+    let lines = app
+        .selected_http_transaction()
+        .map(http_transaction_detail_lines)
+        .unwrap_or_else(|| http_empty_state_lines(app));
+    let details = Paragraph::new(lines)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title("Request / Response"),
+        )
+        .wrap(Wrap { trim: false });
+    frame.render_widget(details, area);
+}
+
+fn http_empty_state_lines(app: &App) -> Vec<Line<'static>> {
+    let mut lines = vec![
+        Line::from("No HTTP request captured yet."),
+        Line::from(""),
+        Line::from(format!(
+            "Packets received from tcpdump: {}",
+            app.packets.len()
+        )),
+    ];
+    if app.packets.is_empty() {
+        lines.push(Line::from(""));
+        lines.push(Line::from(
+            "If this stays at 0, tcpdump is not delivering packets.",
+        ));
+        lines.push(Line::from(
+            "Common causes: missing sudo/BPF permissions, wrong -i interface,",
+        ));
+        lines.push(Line::from(
+            "or BPF filter excluding your traffic. Check the diagnostics line below.",
+        ));
+    } else {
+        lines.push(Line::from(""));
+        lines.push(Line::from(
+            "Packets are flowing but no HTTP request line was detected.",
+        ));
+        lines.push(Line::from(
+            "HTTP mode looks for plaintext HTTP/1.x; HTTPS will not appear here.",
+        ));
+    }
+    if let Some(diag) = app.diagnostics.back() {
+        lines.push(Line::from(""));
+        lines.push(Line::from(format!("tcpdump: {diag}")));
+    }
+    lines
+}
+
+fn human_size(bytes: usize) -> String {
+    const KB: usize = 1024;
+    const MB: usize = 1024 * 1024;
+    if bytes >= MB {
+        format!("{:.1} MB", bytes as f64 / MB as f64)
+    } else if bytes >= KB {
+        format!("{:.1} kB", bytes as f64 / KB as f64)
+    } else {
+        format!("{bytes} B")
+    }
+}
+
+fn http_transaction_detail_lines(tx: &HttpTransaction) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    let label = Style::new().fg(Color::Gray);
+
+    lines.push(Line::from(vec![Span::styled(
+        "General",
+        Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+    )]));
+    lines.push(Line::from(vec![
+        Span::styled("Request URL: ", label),
+        Span::raw(format!(
+            "{}{}",
+            tx.host
+                .clone()
+                .map(|host| format!("http://{host}"))
+                .unwrap_or_else(|| format!("http://{}", tx.destination)),
+            tx.path
+        )),
+    ]));
+    lines.push(Line::from(vec![
+        Span::styled("Method: ", label),
+        Span::raw(tx.method.clone()),
+    ]));
+    let status_line = match (tx.status_code, tx.status_text.as_ref()) {
+        (Some(code), Some(text)) => format!("{code} {text}"),
+        (Some(code), None) => code.to_string(),
+        _ => "(pending)".to_string(),
+    };
+    lines.push(Line::from(vec![
+        Span::styled("Status: ", label),
+        Span::raw(status_line),
+    ]));
+    lines.push(Line::from(vec![
+        Span::styled("Remote Address: ", label),
+        Span::raw(tx.destination.clone()),
+    ]));
+    lines.push(Line::from(vec![
+        Span::styled("Started: ", label),
+        Span::raw(tx.request_timestamp.clone()),
+    ]));
+    if let Some(ts) = &tx.response_timestamp {
+        lines.push(Line::from(vec![
+            Span::styled("Completed: ", label),
+            Span::raw(ts.clone()),
+        ]));
+    }
+
+    lines.push(Line::from(""));
+    lines.push(Line::from(vec![Span::styled(
+        "Request Headers",
+        Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+    )]));
+    lines.push(Line::from(format!(
+        "{} {} {}",
+        tx.method, tx.path, tx.request_version
+    )));
+    if tx.request_headers.is_empty() {
+        lines.push(Line::from("(no headers captured)"));
+    } else {
+        for (name, value) in &tx.request_headers {
+            lines.push(Line::from(vec![
+                Span::styled(format!("{name}: "), label),
+                Span::raw(value.clone()),
+            ]));
+        }
+    }
+
+    lines.push(Line::from(""));
+    lines.push(Line::from(vec![Span::styled(
+        "Response Headers",
+        Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+    )]));
+    if let Some(version) = &tx.response_version {
+        let status_text = tx.status_text.clone().unwrap_or_default();
+        let code = tx
+            .status_code
+            .map(|code| code.to_string())
+            .unwrap_or_default();
+        lines.push(Line::from(format!("{version} {code} {status_text}")));
+    }
+    if tx.response_headers.is_empty() {
+        lines.push(Line::from("(no response captured yet)"));
+    } else {
+        for (name, value) in &tx.response_headers {
+            lines.push(Line::from(vec![
+                Span::styled(format!("{name}: "), label),
+                Span::raw(value.clone()),
+            ]));
+        }
+    }
+
+    lines
 }
 
 fn draw_packet_table(frame: &mut Frame<'_>, area: Rect, app: &App) {

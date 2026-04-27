@@ -6,7 +6,10 @@ use std::{
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::layout::Rect;
 
-use crate::model::{CaptureEvent, Packet};
+use crate::{
+    http::{self, HttpMessage, HttpTransaction},
+    model::{CaptureEvent, Packet},
+};
 
 const MAX_DIAGNOSTICS: usize = 6;
 const MIN_PANEL_PCT: u16 = 10;
@@ -38,10 +41,15 @@ pub struct App {
     pub details_pct: u16,
     pub last_body_area: Option<Rect>,
     pub dragging_border: Option<PanelBorder>,
+    pub http_mode: bool,
+    pub transactions: Vec<HttpTransaction>,
+    pub pending_requests: HashMap<String, usize>,
+    pub selected_transaction: usize,
+    pub next_transaction_number: usize,
 }
 
 impl App {
-    pub fn new(max_packets: usize) -> Self {
+    pub fn new(max_packets: usize, http_mode: bool) -> Self {
         Self {
             packets: Vec::new(),
             pending_packets: Vec::new(),
@@ -61,6 +69,11 @@ impl App {
             details_pct: 28,
             last_body_area: None,
             dragging_border: None,
+            http_mode,
+            transactions: Vec::new(),
+            pending_requests: HashMap::new(),
+            selected_transaction: 0,
+            next_transaction_number: 1,
         }
     }
 
@@ -184,12 +197,18 @@ impl App {
     pub fn status_line(&self) -> String {
         let elapsed = self.started_at.elapsed().as_secs();
         let mode = if self.paused { "paused" } else { "capturing" };
+        let http_segment = if self.http_mode {
+            format!(" | HTTP mode | {} requests", self.transactions.len())
+        } else {
+            String::new()
+        };
         format!(
-            "{mode} | {} packets | {} queued | {}s | autoscroll {}",
+            "{mode} | {} packets | {} queued | {}s | autoscroll {}{}",
             self.packets.len(),
             self.pending_packets.len(),
             elapsed,
-            if self.autoscroll { "on" } else { "off" }
+            if self.autoscroll { "on" } else { "off" },
+            http_segment,
         )
     }
 
@@ -208,13 +227,23 @@ impl App {
             KeyCode::Esc | KeyCode::Char('e') if self.fullscreen_detail => {
                 self.fullscreen_detail = false;
             }
-            KeyCode::Enter if !self.fullscreen_detail && self.selected_packet().is_some() => {
+            KeyCode::Enter
+                if !self.fullscreen_detail
+                    && (self.selected_packet().is_some()
+                        || self.selected_http_transaction().is_some()) =>
+            {
                 self.fullscreen_detail = true;
             }
             KeyCode::Char('[') => self.resize_packets(-(PANEL_RESIZE_STEP as i16)),
             KeyCode::Char(']') => self.resize_packets(PANEL_RESIZE_STEP as i16),
             KeyCode::Char('{') => self.resize_details(-(PANEL_RESIZE_STEP as i16)),
             KeyCode::Char('}') => self.resize_details(PANEL_RESIZE_STEP as i16),
+            KeyCode::Char('j') | KeyCode::Down if self.http_mode => self.select_next_transaction(),
+            KeyCode::Char('k') | KeyCode::Up if self.http_mode => {
+                self.select_previous_transaction()
+            }
+            KeyCode::Char('g') if self.http_mode => self.selected_transaction = 0,
+            KeyCode::Char('G') if self.http_mode => self.select_last_transaction(),
             KeyCode::Char('j') | KeyCode::Down => self.select_next(),
             KeyCode::Char('k') | KeyCode::Up => self.select_previous(),
             KeyCode::Char('g') => self.selected = 0,
@@ -257,6 +286,11 @@ impl App {
             .protocol_counts
             .entry(packet.protocol.clone())
             .or_insert(0) += 1;
+
+        if self.http_mode {
+            self.process_http(&packet);
+        }
+
         self.packets.push(packet);
 
         if self.packets.len() > self.max_packets {
@@ -270,6 +304,73 @@ impl App {
         } else {
             self.clamp_selection();
         }
+    }
+
+    fn process_http(&mut self, packet: &Packet) {
+        let Some(message) = http::extract_from_packet(packet) else {
+            return;
+        };
+        match message {
+            HttpMessage::Request(request) => {
+                let flow_key = http::flow_key(&packet.source, &packet.destination);
+                let transaction = HttpTransaction {
+                    number: self.next_transaction_number,
+                    method: request.method,
+                    path: request.path,
+                    host: request.host,
+                    request_version: request.version,
+                    request_headers: request.headers,
+                    request_timestamp: packet.timestamp.clone(),
+                    flow_key: flow_key.clone(),
+                    status_code: None,
+                    status_text: None,
+                    response_version: None,
+                    response_headers: Vec::new(),
+                    content_length: None,
+                    content_type: None,
+                    response_timestamp: None,
+                    source: packet.source.clone(),
+                    destination: packet.destination.clone(),
+                };
+                self.next_transaction_number += 1;
+                let index = self.transactions.len();
+                self.transactions.push(transaction);
+                self.pending_requests.insert(flow_key, index);
+            }
+            HttpMessage::Response(response) => {
+                let reverse = http::reverse_flow_key(&packet.source, &packet.destination);
+                if let Some(index) = self.pending_requests.remove(&reverse)
+                    && let Some(transaction) = self.transactions.get_mut(index)
+                {
+                    transaction.status_code = Some(response.status_code);
+                    transaction.status_text = Some(response.status_text);
+                    transaction.response_version = Some(response.version);
+                    transaction.response_headers = response.headers;
+                    transaction.content_length = response.content_length;
+                    transaction.content_type = response.content_type;
+                    transaction.response_timestamp = Some(packet.timestamp.clone());
+                }
+            }
+        }
+    }
+
+    pub fn selected_http_transaction(&self) -> Option<&HttpTransaction> {
+        self.transactions.get(self.selected_transaction)
+    }
+
+    fn select_next_transaction(&mut self) {
+        if !self.transactions.is_empty() {
+            self.selected_transaction =
+                (self.selected_transaction + 1).min(self.transactions.len() - 1);
+        }
+    }
+
+    fn select_previous_transaction(&mut self) {
+        self.selected_transaction = self.selected_transaction.saturating_sub(1);
+    }
+
+    fn select_last_transaction(&mut self) {
+        self.selected_transaction = self.transactions.len().saturating_sub(1);
     }
 
     fn push_diagnostic(&mut self, message: String) {
@@ -315,6 +416,15 @@ impl App {
         self.protocol_counts.clear();
         self.next_packet_number = 1;
         self.selected = 0;
+        self.transactions.clear();
+        self.pending_requests.clear();
+        self.next_transaction_number = 1;
+        self.selected_transaction = 0;
+    }
+
+    #[cfg(test)]
+    fn test_apply_packet(&mut self, packet: Packet) {
+        self.apply_capture_event(CaptureEvent::Packet(packet));
     }
 
     fn rebuild_stats(&mut self) {
@@ -325,5 +435,51 @@ impl App {
                 .entry(packet.protocol.clone())
                 .or_insert(0) += 1;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::parser::TcpdumpParser;
+
+    #[test]
+    fn http_mode_captures_request_from_tcpdump_output() {
+        let lines = [
+            "2026-04-27 10:00:00.123456 IP 127.0.0.1.49152 > 127.0.0.1.18080: Flags [P.], length 78",
+            "\t0x0000:  0200 0000 4500 0082 0000 4000 4006 0000  ....E.....@.@...",
+            "\t0x0010:  7f00 0001 7f00 0001 c000 46a0 0000 0001  ..........F.....",
+            "\t0x0020:  0000 0001 8018 18eb fe28 0000 0101 080a  .........(......",
+            "\t0x0030:  0000 0001 0000 0001 4745 5420 2f20 4854  ........GET / HT",
+            "\t0x0040:  5450 2f31 2e31 0d0a 486f 7374 3a20 6c6f  TP/1.1..Host: lo",
+            "\t0x0050:  6361 6c68 6f73 743a 3138 3038 300d 0a0d  calhost:18080...",
+            "\t0x0060:  0a                                       .",
+            "2026-04-27 10:00:00.234567 IP 127.0.0.1.18080 > 127.0.0.1.49152: Flags [P.], length 37",
+            "\t0x0000:  0200 0000 4500 005d 0000 4000 4006 0000  ....E..]..@.@...",
+            "\t0x0010:  7f00 0001 7f00 0001 46a0 c000 0000 0001  ........F.......",
+            "\t0x0020:  0000 0050 8018 18eb fe28 0000 0101 080a  ...P.....(......",
+            "\t0x0030:  0000 0002 0000 0002 4854 5450 2f31 2e31  ........HTTP/1.1",
+            "\t0x0040:  2032 3030 204f 4b0d 0a43 6f6e 7465 6e74  .200.OK..Content",
+            "\t0x0050:  2d4c 656e 6774 683a 2032 0d0a 0d0a 4f4b  -Length:.2....OK",
+        ];
+
+        let mut parser = TcpdumpParser::new();
+        let mut app = App::new(100, true);
+        for line in lines {
+            if let Some(packet) = parser.ingest_line(line) {
+                app.test_apply_packet(packet);
+            }
+        }
+        if let Some(packet) = parser.finish() {
+            app.test_apply_packet(packet);
+        }
+
+        assert_eq!(app.transactions.len(), 1, "expected 1 transaction");
+        let tx = &app.transactions[0];
+        assert_eq!(tx.method, "GET");
+        assert_eq!(tx.path, "/");
+        assert_eq!(tx.host.as_deref(), Some("localhost:18080"));
+        assert_eq!(tx.status_code, Some(200));
+        assert_eq!(tx.content_length, Some(2));
     }
 }

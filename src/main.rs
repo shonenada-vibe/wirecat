@@ -1,5 +1,6 @@
 mod app;
 mod capture;
+mod http;
 mod model;
 mod parser;
 mod ssl_proxy;
@@ -62,9 +63,18 @@ struct Cli {
     #[arg(long)]
     no_tcpdump: bool,
 
+    /// HTTP mode: filter for HTTP traffic and present a Chrome-style request inspector.
+    #[arg(long)]
+    http: bool,
+
     #[arg(value_name = "BPF", trailing_var_arg = true)]
     bpf_filter: Vec<String>,
 }
+
+const HTTP_DEFAULT_FILTER: &[&str] = &[
+    "tcp", "port", "80", "or", "tcp", "port", "8080", "or", "tcp", "port", "8000", "or", "tcp",
+    "port", "3000",
+];
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -75,13 +85,22 @@ fn main() -> Result<()> {
             || cli.interface.is_some()
             || cli.read.is_some()
             || !cli.bpf_filter.is_empty());
+    let bpf_filter = if cli.http && cli.bpf_filter.is_empty() {
+        HTTP_DEFAULT_FILTER
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect()
+    } else {
+        cli.bpf_filter
+    };
+
     let _capture = if should_capture_tcpdump {
         Some(CaptureSession::spawn(
             CaptureConfig {
                 tcpdump: cli.tcpdump,
                 interface: cli.interface,
                 read_file: cli.read,
-                bpf_filter: cli.bpf_filter,
+                bpf_filter,
             },
             tx.clone(),
         )?)
@@ -104,7 +123,7 @@ fn main() -> Result<()> {
     };
 
     let mut terminal = setup_terminal()?;
-    let mut app = App::new(cli.max_packets);
+    let mut app = App::new(cli.max_packets, cli.http);
     let result = run_app(&mut terminal, &mut app, rx);
     restore_terminal(&mut terminal)?;
     result
