@@ -7,7 +7,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent,
 use ratatui::layout::Rect;
 
 use crate::{
-    http::{self, HttpMessage, HttpTransaction},
+    http::{self, HttpMessage, HttpTransaction, ParsedMessage},
     model::{CaptureEvent, Packet},
 };
 
@@ -46,6 +46,9 @@ pub struct App {
     pub pending_requests: HashMap<String, usize>,
     pub selected_transaction: usize,
     pub next_transaction_number: usize,
+    pub flow_buffers: HashMap<String, Vec<u8>>,
+    pub http_payload_packets: usize,
+    pub http_payload_bytes: usize,
 }
 
 impl App {
@@ -74,6 +77,9 @@ impl App {
             pending_requests: HashMap::new(),
             selected_transaction: 0,
             next_transaction_number: 1,
+            flow_buffers: HashMap::new(),
+            http_payload_packets: 0,
+            http_payload_bytes: 0,
         }
     }
 
@@ -307,12 +313,59 @@ impl App {
     }
 
     fn process_http(&mut self, packet: &Packet) {
-        let Some(message) = http::extract_from_packet(packet) else {
+        if packet.hex_dump.is_empty() {
+            return;
+        }
+        let frame_bytes = http::payload_bytes(&packet.hex_dump);
+        let Some(payload) = http::tcp_payload(&frame_bytes) else {
             return;
         };
-        match message {
+        if payload.is_empty() {
+            return;
+        }
+        self.http_payload_packets += 1;
+        self.http_payload_bytes += payload.len();
+
+        let flow_key = http::flow_key(&packet.source, &packet.destination);
+        let mut parsed_messages: Vec<ParsedMessage> = Vec::new();
+        {
+            let buffer = self.flow_buffers.entry(flow_key.clone()).or_default();
+            buffer.extend_from_slice(&payload);
+
+            // Drain as many complete messages as possible.
+            loop {
+                match http::try_consume_message(buffer) {
+                    Some((parsed, consumed)) => {
+                        buffer.drain(..consumed);
+                        parsed_messages.push(parsed);
+                    }
+                    None => {
+                        // The buffer doesn't currently start with a complete
+                        // HTTP message. Try to realign past any leading
+                        // garbage so the next packet's payload has a chance to
+                        // line up. If realigning didn't move the cursor and
+                        // the buffer keeps growing without progress, drop the
+                        // bytes to bound memory.
+                        let before = buffer.len();
+                        if http::realign_buffer(buffer) && buffer.len() < before {
+                            continue;
+                        }
+                        if buffer.len() > 4 * http::MAX_BODY_PREVIEW {
+                            buffer.clear();
+                        }
+                        break;
+                    }
+                }
+            }
+        }
+        for parsed in parsed_messages {
+            self.apply_parsed_message(packet, parsed, &flow_key);
+        }
+    }
+
+    fn apply_parsed_message(&mut self, packet: &Packet, parsed: ParsedMessage, flow_key: &str) {
+        match parsed.message {
             HttpMessage::Request(request) => {
-                let flow_key = http::flow_key(&packet.source, &packet.destination);
                 let transaction = HttpTransaction {
                     number: self.next_transaction_number,
                     method: request.method,
@@ -320,14 +373,17 @@ impl App {
                     host: request.host,
                     request_version: request.version,
                     request_headers: request.headers,
+                    request_body: parsed.body,
                     request_timestamp: packet.timestamp.clone(),
-                    flow_key: flow_key.clone(),
+                    flow_key: flow_key.to_string(),
                     status_code: None,
                     status_text: None,
                     response_version: None,
                     response_headers: Vec::new(),
                     content_length: None,
                     content_type: None,
+                    response_body: Vec::new(),
+                    response_body_truncated: false,
                     response_timestamp: None,
                     source: packet.source.clone(),
                     destination: packet.destination.clone(),
@@ -335,7 +391,7 @@ impl App {
                 self.next_transaction_number += 1;
                 let index = self.transactions.len();
                 self.transactions.push(transaction);
-                self.pending_requests.insert(flow_key, index);
+                self.pending_requests.insert(flow_key.to_string(), index);
             }
             HttpMessage::Response(response) => {
                 let reverse = http::reverse_flow_key(&packet.source, &packet.destination);
@@ -348,6 +404,8 @@ impl App {
                     transaction.response_headers = response.headers;
                     transaction.content_length = response.content_length;
                     transaction.content_type = response.content_type;
+                    transaction.response_body = parsed.body;
+                    transaction.response_body_truncated = parsed.body_truncated;
                     transaction.response_timestamp = Some(packet.timestamp.clone());
                 }
             }
@@ -420,6 +478,9 @@ impl App {
         self.pending_requests.clear();
         self.next_transaction_number = 1;
         self.selected_transaction = 0;
+        self.flow_buffers.clear();
+        self.http_payload_packets = 0;
+        self.http_payload_bytes = 0;
     }
 
     #[cfg(test)]
@@ -443,29 +504,110 @@ mod tests {
     use super::*;
     use crate::parser::TcpdumpParser;
 
+    fn make_packet_lines(payload: &[u8], src_port: u16, dst_port: u16) -> Vec<String> {
+        // Build a synthetic loopback frame: DLT_NULL(4) + IPv4(20) + TCP(20) + payload.
+        let total_len = (20 + 20 + payload.len()) as u16;
+        let mut frame = vec![0x02u8, 0x00, 0x00, 0x00];
+        // IPv4 header
+        frame.push(0x45); // version=4 IHL=5
+        frame.push(0x00); // DSCP/ECN
+        frame.extend_from_slice(&total_len.to_be_bytes());
+        frame.extend_from_slice(&[0x00, 0x00]); // ID
+        frame.extend_from_slice(&[0x40, 0x00]); // flags+fragoff
+        frame.push(0x40); // TTL
+        frame.push(0x06); // protocol = TCP
+        frame.extend_from_slice(&[0x00, 0x00]); // checksum
+        frame.extend_from_slice(&[127, 0, 0, 1]); // src ip
+        frame.extend_from_slice(&[127, 0, 0, 1]); // dst ip
+        // TCP header (20 bytes, no options)
+        frame.extend_from_slice(&src_port.to_be_bytes());
+        frame.extend_from_slice(&dst_port.to_be_bytes());
+        frame.extend_from_slice(&[0x00, 0x00, 0x00, 0x01]); // seq
+        frame.extend_from_slice(&[0x00, 0x00, 0x00, 0x01]); // ack
+        frame.push(0x50); // data offset 5 (20 bytes), reserved=0
+        frame.push(0x18); // flags ACK|PSH
+        frame.extend_from_slice(&[0x18, 0xeb]); // window
+        frame.extend_from_slice(&[0x00, 0x00]); // checksum
+        frame.extend_from_slice(&[0x00, 0x00]); // urgent
+        frame.extend_from_slice(payload);
+
+        // Format as tcpdump -XX hex_dump lines (tab-prefixed).
+        let mut lines = Vec::new();
+        for (idx, chunk) in frame.chunks(16).enumerate() {
+            let mut hex = String::new();
+            for (i, byte) in chunk.iter().enumerate() {
+                if i > 0 && i % 2 == 0 {
+                    hex.push(' ');
+                }
+                hex.push_str(&format!("{byte:02x}"));
+            }
+            lines.push(format!("\t0x{:04x}:  {hex}", idx * 16));
+        }
+        lines
+    }
+
+    fn make_packet_summary(src_port: u16, dst_port: u16, length: usize) -> String {
+        format!(
+            "2026-04-27 10:00:00.123456 IP 127.0.0.1.{src_port} > 127.0.0.1.{dst_port}: Flags [P.], length {length}"
+        )
+    }
+
+    fn make_ipv6_packet_lines(payload: &[u8], src_port: u16, dst_port: u16) -> Vec<String> {
+        // Build a synthetic macOS lo0 IPv6 frame: DLT_NULL(4) + IPv6(40) + TCP(20) + payload.
+        let mut frame = vec![0x1e, 0x00, 0x00, 0x00];
+        frame.extend_from_slice(&[0x60, 0x00, 0x00, 0x00]);
+        frame.extend_from_slice(&((20 + payload.len()) as u16).to_be_bytes());
+        frame.push(0x06); // next header = TCP
+        frame.push(0x40); // hop limit
+        frame.extend_from_slice(&[0; 15]);
+        frame.push(1); // ::1
+        frame.extend_from_slice(&[0; 15]);
+        frame.push(1); // ::1
+        frame.extend_from_slice(&src_port.to_be_bytes());
+        frame.extend_from_slice(&dst_port.to_be_bytes());
+        frame.extend_from_slice(&[0x00, 0x00, 0x00, 0x01]); // seq
+        frame.extend_from_slice(&[0x00, 0x00, 0x00, 0x01]); // ack
+        frame.push(0x50); // data offset 5 (20 bytes)
+        frame.push(0x18); // flags ACK|PSH
+        frame.extend_from_slice(&[0x18, 0xeb]); // window
+        frame.extend_from_slice(&[0x00, 0x00]); // checksum
+        frame.extend_from_slice(&[0x00, 0x00]); // urgent
+        frame.extend_from_slice(payload);
+
+        let mut lines = Vec::new();
+        for (idx, chunk) in frame.chunks(16).enumerate() {
+            let mut hex = String::new();
+            for (i, byte) in chunk.iter().enumerate() {
+                if i > 0 && i % 2 == 0 {
+                    hex.push(' ');
+                }
+                hex.push_str(&format!("{byte:02x}"));
+            }
+            lines.push(format!("\t0x{:04x}:  {hex}", idx * 16));
+        }
+        lines
+    }
+
+    fn make_ipv6_packet_summary(src_port: u16, dst_port: u16, length: usize) -> String {
+        format!(
+            "2026-04-27 10:00:00.123456 IP6 ::1.{src_port} > ::1.{dst_port}: Flags [P.], length {length}"
+        )
+    }
+
     #[test]
-    fn http_mode_captures_request_from_tcpdump_output() {
-        let lines = [
-            "2026-04-27 10:00:00.123456 IP 127.0.0.1.49152 > 127.0.0.1.18080: Flags [P.], length 78",
-            "\t0x0000:  0200 0000 4500 0082 0000 4000 4006 0000  ....E.....@.@...",
-            "\t0x0010:  7f00 0001 7f00 0001 c000 46a0 0000 0001  ..........F.....",
-            "\t0x0020:  0000 0001 8018 18eb fe28 0000 0101 080a  .........(......",
-            "\t0x0030:  0000 0001 0000 0001 4745 5420 2f20 4854  ........GET / HT",
-            "\t0x0040:  5450 2f31 2e31 0d0a 486f 7374 3a20 6c6f  TP/1.1..Host: lo",
-            "\t0x0050:  6361 6c68 6f73 743a 3138 3038 300d 0a0d  calhost:18080...",
-            "\t0x0060:  0a                                       .",
-            "2026-04-27 10:00:00.234567 IP 127.0.0.1.18080 > 127.0.0.1.49152: Flags [P.], length 37",
-            "\t0x0000:  0200 0000 4500 005d 0000 4000 4006 0000  ....E..]..@.@...",
-            "\t0x0010:  7f00 0001 7f00 0001 46a0 c000 0000 0001  ........F.......",
-            "\t0x0020:  0000 0050 8018 18eb fe28 0000 0101 080a  ...P.....(......",
-            "\t0x0030:  0000 0002 0000 0002 4854 5450 2f31 2e31  ........HTTP/1.1",
-            "\t0x0040:  2032 3030 204f 4b0d 0a43 6f6e 7465 6e74  .200.OK..Content",
-            "\t0x0050:  2d4c 656e 6774 683a 2032 0d0a 0d0a 4f4b  -Length:.2....OK",
-        ];
+    fn http_mode_captures_request_and_response_body() {
+        let request_payload = b"GET / HTTP/1.1\r\nHost: localhost:18080\r\n\r\n";
+        let response_payload = b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 13\r\n\r\nHello, world!";
+
+        let mut lines = Vec::new();
+        lines.push(make_packet_summary(49152, 18080, request_payload.len()));
+        lines.extend(make_packet_lines(request_payload, 49152, 18080));
+        lines.push(make_packet_summary(18080, 49152, response_payload.len()));
+        lines.extend(make_packet_lines(response_payload, 18080, 49152));
 
         let mut parser = TcpdumpParser::new();
         let mut app = App::new(100, true);
-        for line in lines {
+        for line in &lines {
             if let Some(packet) = parser.ingest_line(line) {
                 app.test_apply_packet(packet);
             }
@@ -480,6 +622,100 @@ mod tests {
         assert_eq!(tx.path, "/");
         assert_eq!(tx.host.as_deref(), Some("localhost:18080"));
         assert_eq!(tx.status_code, Some(200));
-        assert_eq!(tx.content_length, Some(2));
+        assert_eq!(tx.content_length, Some(13));
+        assert_eq!(tx.response_body, b"Hello, world!");
+        assert!(!tx.response_body_truncated);
+        assert_eq!(tx.content_type.as_deref(), Some("text/plain"));
+    }
+
+    #[test]
+    fn http_mode_captures_ipv6_loopback_request() {
+        let request_payload = b"GET /ipv6 HTTP/1.1\r\nHost: localhost:8080\r\n\r\n";
+        let mut lines = Vec::new();
+        lines.push(make_ipv6_packet_summary(49152, 8080, request_payload.len()));
+        lines.extend(make_ipv6_packet_lines(request_payload, 49152, 8080));
+
+        let mut parser = TcpdumpParser::new();
+        let mut app = App::new(100, true);
+        for line in &lines {
+            if let Some(packet) = parser.ingest_line(line) {
+                app.test_apply_packet(packet);
+            }
+        }
+        if let Some(packet) = parser.finish() {
+            app.test_apply_packet(packet);
+        }
+
+        assert_eq!(app.transactions.len(), 1);
+        let tx = &app.transactions[0];
+        assert_eq!(tx.method, "GET");
+        assert_eq!(tx.path, "/ipv6");
+        assert_eq!(tx.host.as_deref(), Some("localhost:8080"));
+        assert_eq!(tx.source, "::1.49152");
+        assert_eq!(tx.destination, "::1.8080");
+    }
+
+    #[test]
+    fn http_mode_reassembles_response_body_across_segments() {
+        // Send response headers in one packet and body in another.
+        let response_head = b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\n";
+        let response_body = b"hello";
+
+        let mut lines = Vec::new();
+        let request_payload = b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n";
+        lines.push(make_packet_summary(40000, 80, request_payload.len()));
+        lines.extend(make_packet_lines(request_payload, 40000, 80));
+
+        lines.push(make_packet_summary(80, 40000, response_head.len()));
+        lines.extend(make_packet_lines(response_head, 80, 40000));
+
+        lines.push(make_packet_summary(80, 40000, response_body.len()));
+        lines.extend(make_packet_lines(response_body, 80, 40000));
+
+        let mut parser = TcpdumpParser::new();
+        let mut app = App::new(100, true);
+        for line in &lines {
+            if let Some(packet) = parser.ingest_line(line) {
+                app.test_apply_packet(packet);
+            }
+        }
+        if let Some(packet) = parser.finish() {
+            app.test_apply_packet(packet);
+        }
+
+        assert_eq!(app.transactions.len(), 1);
+        let tx = &app.transactions[0];
+        assert_eq!(tx.status_code, Some(200));
+        assert_eq!(tx.response_body, b"hello");
+    }
+
+    #[test]
+    fn http_mode_decodes_chunked_response_body() {
+        let request_payload = b"GET /chunked HTTP/1.1\r\nHost: example.com\r\n\r\n";
+        // Two chunks "Hel" and "lo" plus terminating zero chunk.
+        let response_payload = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nHel\r\n2\r\nlo\r\n0\r\n\r\n";
+
+        let mut lines = Vec::new();
+        lines.push(make_packet_summary(40000, 80, request_payload.len()));
+        lines.extend(make_packet_lines(request_payload, 40000, 80));
+        lines.push(make_packet_summary(80, 40000, response_payload.len()));
+        lines.extend(make_packet_lines(response_payload, 80, 40000));
+
+        let mut parser = TcpdumpParser::new();
+        let mut app = App::new(100, true);
+        for line in &lines {
+            if let Some(packet) = parser.ingest_line(line) {
+                app.test_apply_packet(packet);
+            }
+        }
+        if let Some(packet) = parser.finish() {
+            app.test_apply_packet(packet);
+        }
+
+        assert_eq!(app.transactions.len(), 1);
+        let tx = &app.transactions[0];
+        assert_eq!(tx.status_code, Some(200));
+        assert_eq!(tx.response_body, b"Hello");
+        assert!(!tx.response_body_truncated);
     }
 }

@@ -126,10 +126,11 @@ fn parse_endpoints(summary: &str) -> (String, String) {
         .trim_matches(',')
         .to_string();
     let destination = right
-        .split(':')
-        .next()
-        .unwrap_or("-")
+        .split_once(": ")
+        .map(|(destination, _)| destination)
+        .unwrap_or(right)
         .trim()
+        .trim_end_matches(':')
         .trim_matches(',')
         .to_string();
 
@@ -196,6 +197,19 @@ mod tests {
         assert_eq!(packet.source, "10.0.0.2.54000");
         assert_eq!(packet.destination, "142.250.72.14.443");
         assert_eq!(packet.length, Some(98));
+    }
+
+    #[test]
+    fn parses_ipv6_header() {
+        let packet = parse_header(
+            7,
+            "2026-04-27 15:35:01.123456 IP6 ::1.54000 > ::1.8080: Flags [P.], length 42",
+        );
+
+        assert_eq!(packet.protocol, "IP6");
+        assert_eq!(packet.source, "::1.54000");
+        assert_eq!(packet.destination, "::1.8080");
+        assert_eq!(packet.length, Some(42));
     }
 
     #[test]

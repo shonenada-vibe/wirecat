@@ -262,6 +262,7 @@ fn draw_http_details(frame: &mut Frame<'_>, area: Rect, app: &App) {
 }
 
 fn http_empty_state_lines(app: &App) -> Vec<Line<'static>> {
+    let buffered_total: usize = app.flow_buffers.values().map(|b| b.len()).sum();
     let mut lines = vec![
         Line::from("No HTTP request captured yet."),
         Line::from(""),
@@ -269,11 +270,20 @@ fn http_empty_state_lines(app: &App) -> Vec<Line<'static>> {
             "Packets received from tcpdump: {}",
             app.packets.len()
         )),
+        Line::from(format!(
+            "Packets with TCP payload extracted: {} ({} bytes total)",
+            app.http_payload_packets, app.http_payload_bytes
+        )),
+        Line::from(format!(
+            "Active flows / buffered bytes: {} / {}",
+            app.flow_buffers.len(),
+            buffered_total
+        )),
     ];
     if app.packets.is_empty() {
         lines.push(Line::from(""));
         lines.push(Line::from(
-            "If this stays at 0, tcpdump is not delivering packets.",
+            "If packets stays at 0, tcpdump is not delivering packets.",
         ));
         lines.push(Line::from(
             "Common causes: missing sudo/BPF permissions, wrong -i interface,",
@@ -281,13 +291,24 @@ fn http_empty_state_lines(app: &App) -> Vec<Line<'static>> {
         lines.push(Line::from(
             "or BPF filter excluding your traffic. Check the diagnostics line below.",
         ));
+    } else if app.http_payload_packets == 0 {
+        lines.push(Line::from(""));
+        lines.push(Line::from(
+            "Packets are arriving but TCP payload extraction failed for all of them.",
+        ));
+        lines.push(Line::from(
+            "Possible causes: unfamiliar link-layer header, IPv6, or non-TCP traffic.",
+        ));
     } else {
         lines.push(Line::from(""));
         lines.push(Line::from(
-            "Packets are flowing but no HTTP request line was detected.",
+            "TCP payloads are being captured, but no HTTP/1.x message has been",
         ));
         lines.push(Line::from(
-            "HTTP mode looks for plaintext HTTP/1.x; HTTPS will not appear here.",
+            "fully decoded yet. The capture may have started mid-stream, or",
+        ));
+        lines.push(Line::from(
+            "responses lack Content-Length (e.g. chunked encoding is not yet supported).",
         ));
     }
     if let Some(diag) = app.diagnostics.back() {
@@ -400,7 +421,41 @@ fn http_transaction_detail_lines(tx: &HttpTransaction) -> Vec<Line<'static>> {
         }
     }
 
+    if !tx.request_body.is_empty() {
+        lines.push(Line::from(""));
+        lines.push(Line::from(vec![Span::styled(
+            "Request Body",
+            Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+        )]));
+        push_body_lines(&mut lines, &tx.request_body, false);
+    }
+
+    if tx.response_timestamp.is_some() {
+        lines.push(Line::from(""));
+        lines.push(Line::from(vec![Span::styled(
+            "Response Body",
+            Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+        )]));
+        if tx.response_body.is_empty() {
+            lines.push(Line::from("(empty)"));
+        } else {
+            push_body_lines(&mut lines, &tx.response_body, tx.response_body_truncated);
+        }
+    }
+
     lines
+}
+
+fn push_body_lines(lines: &mut Vec<Line<'static>>, body: &[u8], truncated: bool) {
+    lines.push(Line::from(format!(
+        "({} bytes{})",
+        body.len(),
+        if truncated { ", truncated" } else { "" }
+    )));
+    let text = String::from_utf8_lossy(body);
+    for line in text.lines().take(200) {
+        lines.push(Line::from(line.to_string()));
+    }
 }
 
 fn draw_packet_table(frame: &mut Frame<'_>, area: Rect, app: &App) {
