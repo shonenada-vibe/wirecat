@@ -29,7 +29,7 @@ Rust 1.90+ is required when building from source.
 curl -fsSL https://raw.githubusercontent.com/shonenada-vibe/wirecat/main/install.sh | bash
 ```
 
-The installer downloads the latest release for your platform and installs `wirecat` to `/usr/local/bin` when possible. Set `WIRECAT_INSTALL_DIR` to choose another location:
+The installer downloads the latest release for your platform and installs `wirecat` to `/usr/local/bin` when possible. If the release binary is not compatible with your system libc, it falls back to `cargo install` from source. Set `WIRECAT_INSTALL_DIR` to choose another location:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/shonenada-vibe/wirecat/main/install.sh | WIRECAT_INSTALL_DIR="$HOME/.local/bin" bash
