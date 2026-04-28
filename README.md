@@ -12,7 +12,6 @@ A terminal packet analyzer for `tcpdump`, written in Rust. It uses `tcpdump` for
 
 ## Requirements
 
-- Rust 1.90+
 - `tcpdump`
 - capture permissions for your platform
 
@@ -20,6 +19,20 @@ On macOS and Linux, live capture often requires elevated permissions:
 
 ```sh
 sudo cargo run -- -i en0
+```
+
+Rust 1.90+ is required when building from source.
+
+## Install
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/shonenada-vibe/wirecat/main/install.sh | bash
+```
+
+The installer downloads the latest release for your platform and installs `wirecat` to `/usr/local/bin` when possible. Set `WIRECAT_INSTALL_DIR` to choose another location:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/shonenada-vibe/wirecat/main/install.sh | WIRECAT_INSTALL_DIR="$HOME/.local/bin" bash
 ```
 
 ## Usage
