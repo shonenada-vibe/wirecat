@@ -3,8 +3,7 @@ use std::{
     time::Instant,
 };
 
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
-use ratatui::layout::Rect;
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use crate::{
     http::{self, HttpMessage, HttpTransaction, ParsedMessage},
@@ -14,12 +13,6 @@ use crate::{
 const MAX_DIAGNOSTICS: usize = 6;
 const MIN_PANEL_PCT: u16 = 10;
 const PANEL_RESIZE_STEP: u16 = 2;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PanelBorder {
-    PacketsDetails,
-    DetailsHex,
-}
 
 #[derive(Debug)]
 pub struct App {
@@ -39,8 +32,6 @@ pub struct App {
     pub started_at: Instant,
     pub packets_pct: u16,
     pub details_pct: u16,
-    pub last_body_area: Option<Rect>,
-    pub dragging_border: Option<PanelBorder>,
     pub http_mode: bool,
     pub transactions: Vec<HttpTransaction>,
     pub pending_requests: HashMap<String, usize>,
@@ -70,8 +61,6 @@ impl App {
             started_at: Instant::now(),
             packets_pct: 48,
             details_pct: 28,
-            last_body_area: None,
-            dragging_border: None,
             http_mode,
             transactions: Vec::new(),
             pending_requests: HashMap::new(),
@@ -108,70 +97,6 @@ impl App {
         let hex = 100 - self.packets_pct - new_details;
         if hex >= MIN_PANEL_PCT {
             self.details_pct = new_details;
-        }
-    }
-
-    pub fn handle_mouse(&mut self, event: MouseEvent) {
-        let Some(body) = self.last_body_area else {
-            return;
-        };
-        match event.kind {
-            MouseEventKind::Down(MouseButton::Left) => {
-                if let Some(border) = self.border_at(body, event.column, event.row) {
-                    self.dragging_border = Some(border);
-                }
-            }
-            MouseEventKind::Drag(MouseButton::Left) => {
-                if let Some(border) = self.dragging_border {
-                    self.apply_drag(body, border, event.row);
-                }
-            }
-            MouseEventKind::Up(MouseButton::Left) => {
-                self.dragging_border = None;
-            }
-            _ => {}
-        }
-    }
-
-    fn border_at(&self, body: Rect, col: u16, row: u16) -> Option<PanelBorder> {
-        if col < body.x || col >= body.x + body.width {
-            return None;
-        }
-        let packets_h = body.height * self.packets_pct / 100;
-        let details_h = body.height * self.details_pct / 100;
-        let border1 = body.y + packets_h.saturating_sub(1);
-        let border2 = body.y + (packets_h + details_h).saturating_sub(1);
-        if row == border1 {
-            Some(PanelBorder::PacketsDetails)
-        } else if row == border2 {
-            Some(PanelBorder::DetailsHex)
-        } else {
-            None
-        }
-    }
-
-    fn apply_drag(&mut self, body: Rect, border: PanelBorder, row: u16) {
-        if body.height == 0 {
-            return;
-        }
-        let row = row.max(body.y).min(body.y + body.height - 1);
-        let offset = row - body.y;
-        let pct = ((offset as u32 + 1) * 100 / body.height as u32) as i32;
-        match border {
-            PanelBorder::PacketsDetails => {
-                let target = pct.clamp(
-                    MIN_PANEL_PCT as i32,
-                    100 - MIN_PANEL_PCT as i32 - self.details_pct as i32,
-                ) as u16;
-                self.packets_pct = target;
-            }
-            PanelBorder::DetailsHex => {
-                let target = pct.clamp(
-                    self.packets_pct as i32 + MIN_PANEL_PCT as i32,
-                    100 - MIN_PANEL_PCT as i32,
-                ) as u16;
-                self.details_pct = target.saturating_sub(self.packets_pct);
-            }
         }
     }
 

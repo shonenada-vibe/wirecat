@@ -15,7 +15,6 @@ const SELECTED_STYLE: Style = Style::new()
 
 pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
     if app.fullscreen_detail {
-        app.last_body_area = None;
         let root = Layout::default()
             .direction(Direction::Vertical)
             .constraints([Constraint::Min(1), Constraint::Length(1)])
@@ -35,7 +34,6 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
         .split(frame.area());
 
     draw_header(frame, root[0], app);
-    app.last_body_area = Some(root[1]);
     draw_body(frame, root[1], app);
     draw_footer(frame, root[2], app);
 
@@ -560,7 +558,7 @@ fn draw_footer(frame: &mut Frame<'_>, area: Rect, app: &App) {
         .map(|value| format!(" | {value}"))
         .unwrap_or_default();
     let text = format!(
-        "q quit | Enter detail | / filter | p pause | a autoscroll | j/k move | g/G top/bottom | c clear | [/] resize packets | {{/}} resize details | drag borders{latest_diag}"
+        "q quit | Enter detail | / filter | p pause | a autoscroll | j/k move | g/G top/bottom | c clear | [/] resize packets | {{/}} resize details{latest_diag}"
     );
     let footer = Paragraph::new(text).style(Style::new().fg(Color::DarkGray));
     frame.render_widget(footer, area);
